@@ -12,6 +12,12 @@ contract UBI is ForHumans, Initializable, ERC20BurnableUpgradeable, ERC20Snapsho
 
   using SafeMath for uint256;
 
+  struct AccruePolicy {
+    uint256 accruedPerSecond;
+    uint64 validFrom;
+    uint64 validTo;
+  }
+
   /* Events */
 
   /** @dev Emitted when UBI is minted or taken by a reporter.
@@ -27,17 +33,17 @@ contract UBI is ForHumans, Initializable, ERC20BurnableUpgradeable, ERC20Snapsho
 
   /* Storage */
 
-  /// @dev How many tokens per second will be minted for every valid human.
-  uint256 public accruedPerSecond;
-
   /// @dev The contract's governor.
   address public governor;
+
+  /// @dev Persists time of last minted tokens for any given address. accruePolicies[policyID]
+  mapping(uint256 => AccruePolicy) public accruePolicies;
 
   /// @dev Persists time of last minted tokens for any given address.
   mapping(address => uint256) public accruedSince;
 
-  /// @dev Tokens withdrawn
-  mapping(address => uint256) public withdrawn;
+  /// @dev Persists time of last minted tokens for any given address. lastAccrued[human][policy]
+  mapping(address => mapping(uint256 => uint256)) public lastAccrued;
 
   /* Modifiers */
 
@@ -84,13 +90,31 @@ contract UBI is ForHumans, Initializable, ERC20BurnableUpgradeable, ERC20Snapsho
 
   /* External */
 
+  function addPolicy(uint256 policyID, uint256 accruedPerSecond, uint256 validFrom, uint256 validTo) external onlyByGovernor() {
+    AccruePolicy storage policy = accruePolicies[policyID];
+    require(policy.accruedPerSecond == 0, "Policy already set.");
+    require(validFrom < validTo, "Invalid parameters.");
+
+    policy.accruedPerSecond = accruedPerSecond;
+    policy.validFrom = validFrom;
+    policy.validTo = validTo;
+  }
+
+  function finalizePolicy(uint256 policyID) external onlyByGovernor() {
+    AccruePolicy storage policy = accruePolicies[policyID];
+    require(policy.accruedPerSecond != 0, "Invalid policy.");
+    require(policy.validTo > block.timestamp, "Invalid policy.");
+    policy.validTo = block.timestamp;
+  }
+
   /** @dev Universal Basic Income mechanism
   *  @param human The submission ID.
+  *  @param policyID The accruing policy ID.
   */
-  function mintAccrued(address human) external isRegistered(human, true) isAccruing(human, true) {
-    uint256 newSupply = getAccruedValue(human);
+  function mintAccrued(address human, uint256 policyID) external isRegistered(human, true) isAccruing(human, true) {
+    uint256 newSupply = getAccruedValue(human, policyID);
 
-    withdrawn[human] += newSupply;
+    lastAccrued[human][policyID] = block.timestamp;
 
     _mint(human, newSupply);
 
@@ -110,11 +134,12 @@ contract UBI is ForHumans, Initializable, ERC20BurnableUpgradeable, ERC20Snapsho
   *  leftover accrued UBI.
   *  @param human The submission ID.
   */
-  function reportRemoval(address human) external isAccruing(human, true) isRegistered(human, false) {
-    uint256 newSupply = getAccruedValue(human);
+  function reportRemoval(address human, uint256[] calldata policyIDs) external isAccruing(human, true) isRegistered(human, false) {
+    uint256 newSupply;
+    for (uint256 i; i < policyIDs.length; i++)
+     newSupply += getAccruedValue(human, policyIDs[i]);
 
     accruedSince[human] = 0;
-    withdrawn[human] = 0;
 
     _mint(msg.sender, newSupply);
 
@@ -144,15 +169,25 @@ contract UBI is ForHumans, Initializable, ERC20BurnableUpgradeable, ERC20Snapsho
 
   /** @dev Calculates how much UBI a submission has available for withdrawal.
   *  @param human The submission ID.
+  *  @param policyID The accruing policy ID.
   *  @return accrued The available UBI for withdrawal.
   */
-  function getAccruedValue(address human) public view returns (uint256 accrued) {
-    uint totalAccured = accruedPerSecond.mul(block.timestamp.sub(accruedSince[human]));
+  function getAccruedValue(address human, uint256 policyID) public view returns (uint256 accrued) {
+    // If this human have not started to accrue, return 0.
+    if (accruedSince[human] == 0) return 0;
 
-    // If this human does not have started to accrue, or current available balance to withdraw is negative, return 0.
-    if (accruedSince[human] == 0 || withdrawn[human] >= totalAccured) return 0;
+    AccruePolicy storage policy = accruePolicies[policyID];
 
-    else return totalAccured.sub(withdrawn[human]);
+    uint256 _lastAccrued = lastAccrued[human][policyID];
+    if (lastAccrued == 0) {
+      _lastAccrued = accruedSince[human] > policy.validFrom ? accruedSince[human] : policy.validFrom;
+    }
+    uint256 _accrueUntil = block.timestamp <= policy.validTo ? block.timestamp : policy.validTo; 
+
+    if (_accrueUntil < _lastAccrued)
+      return 0;
+    else
+      return (_accrueUntil - _lastAccrued) * policy.accruedPerSecond;
   }
 
   /** Overrides */
